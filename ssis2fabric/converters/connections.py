@@ -71,7 +71,6 @@ def build_connection_payload(cm: SSISConnectionManager, dummy: bool = False) -> 
         credential_details: Dict[str, Any] = {
             "singleSignOnType": "None",
             "connectionEncryption": "NotEncrypted",
-            "skipTestConnection": True,
             "credentials": {
                 "credentialType": "Basic",
                 "username": "TODO_USER",
@@ -95,7 +94,6 @@ def build_connection_payload(cm: SSISConnectionManager, dummy: bool = False) -> 
         credential_details = {
             "singleSignOnType": "None",
             "connectionEncryption": "NotEncrypted",
-            "skipTestConnection": True,
             "credentials": {"credentialType": "Anonymous"},
         }
     elif conn_type == "HTTP":
@@ -115,8 +113,39 @@ def build_connection_payload(cm: SSISConnectionManager, dummy: bool = False) -> 
         credential_details = {
             "singleSignOnType": "None",
             "connectionEncryption": "NotEncrypted",
-            "skipTestConnection": True,
             "credentials": {"credentialType": "Anonymous"},
+        }
+    elif conn_type == "FTP":
+        ftp_server = cm.server_name or cm.url or cm.properties.get("ServerName")
+        if not ftp_server and cm.connection_string:
+            # FTP connection strings look like "ServerName=host;ServerPort=21;"
+            for part in cm.connection_string.split(";"):
+                key, _, val = part.partition("=")
+                if key.strip().lower() in ("servername", "data source", "server") and val.strip():
+                    ftp_server = val.strip()
+                    break
+        ftp_server = ftp_server or "TODO_FTP_SERVER"
+        connectivity_settings = {
+            "connectivityType": "ShareableCloud",
+            "gatewaySettings": {
+                "gatewayObjectType": "None",
+            },
+            "connectionDetails": {
+                "type": "FTP",
+                "creationMethod": "FTP",
+                "parameters": [
+                    {"dataType": "Text", "name": "server", "value": ftp_server},
+                ],
+            },
+        }
+        credential_details = {
+            "singleSignOnType": "None",
+            "connectionEncryption": "NotEncrypted",
+            "credentials": {
+                "credentialType": "Basic",
+                "username": "TODO_USER",
+                "password": "TODO_PASSWORD",
+            },
         }
     else:
         # Generic fallback — dummy SQL connection
@@ -133,7 +162,6 @@ def build_connection_payload(cm: SSISConnectionManager, dummy: bool = False) -> 
         credential_details = {
             "singleSignOnType": "None",
             "connectionEncryption": "NotEncrypted",
-            "skipTestConnection": True,
             "credentials": {"credentialType": "Anonymous"},
         }
 
@@ -152,9 +180,26 @@ def convert_connections(
     """
     Return a list of Fabric connection creation payloads for all given
     SSISConnectionManager instances.
+
+    Each descriptor carries a ``supported`` flag.  ``File`` connections map to
+    local file paths that are not reachable from cloud Fabric and are not a
+    valid ShareableCloud connection kind, so they are marked unsupported; the
+    caller should skip the create call and use a placeholder connection id.
     """
     payloads = []
     for cm in connection_managers:
+        conn_type, _ = _map_connection_type(cm.connection_type)
+        supported = conn_type != "File"
         payload = build_connection_payload(cm, dummy=True)
-        payloads.append({"ssis_name": cm.name, "ssis_id": cm.id, "payload": payload})
+        payloads.append({
+            "ssis_name": cm.name,
+            "ssis_id": cm.id,
+            "payload": payload,
+            "supported": supported,
+            "unsupported_reason": (
+                None if supported
+                else "File connections reference local paths and require an "
+                     "on-premises data gateway; configure manually in Fabric."
+            ),
+        })
     return payloads

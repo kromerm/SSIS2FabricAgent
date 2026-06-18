@@ -6,7 +6,7 @@ Strategy
 * Walk the SSISPackage.tasks list and convert each task to a Fabric activity.
 * SSISPrecedenceConstraints become activity dependsOn entries.
 * Containers (ForEach, Sequence) map to their Fabric equivalents.
-* Data Flow tasks generate a RefreshDataFlow activity referencing the
+* Data Flow tasks generate a RefreshDataflow activity referencing the
   Dataflow Gen2 that was created separately.
 * Activities that cannot be fully represented use state=InActive so that
   the pipeline can still be created in Fabric and fixed up manually.
@@ -27,6 +27,7 @@ from ..models import (
     SSISSequenceContainer,
     SSISTask,
 )
+from .dataflow import is_copy_candidate, classify_component as _classify_component
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,6 +36,23 @@ from ..models import (
 _INACTIVE = {"state": "InActive", "onInactiveMarkAs": "Succeeded"}
 
 _DUMMY_CONNECTION_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def _is_real_conn(conn_id: str) -> bool:
+    """True when the connection id is a real, created Fabric connection."""
+    return bool(conn_id) and conn_id != _DUMMY_CONNECTION_ID
+
+
+def _conn_ref(conn_id: str) -> Dict[str, Any]:
+    """Return an ``externalReferences`` block only for a real connection id.
+
+    When the connection could not be created (dummy/placeholder id), the block
+    is omitted entirely. Fabric validates every connection GUID it finds in a
+    pipeline definition — even on InActive activities — so a dummy GUID makes the
+    whole ``updateDefinition`` fail. Omitting it lets the definition import as a
+    shell; the user then wires the connection in the Fabric UI.
+    """
+    return {"externalReferences": {"connection": conn_id}} if _is_real_conn(conn_id) else {}
 
 
 def _safe(name: str) -> str:
@@ -105,20 +123,25 @@ def _convert_execute_sql(
     sql = task.properties.get("sql_statement", "")
     conn_id = conn_id_map.get(task.connection_ref or "", _DUMMY_CONNECTION_ID)
 
+    conn_resolved = _is_real_conn(conn_id)
+
     if sp_name:
-        return {
+        activity = {
             "type": "SqlServerStoredProcedure",
             "typeProperties": {
                 "storedProcedureName": sp_name,
                 "storedProcedureParameters": {},
             },
-            "externalReferences": {"connection": conn_id},
+            **_conn_ref(conn_id),
         }
+        if not conn_resolved:
+            activity.update(_INACTIVE)
+        return activity
 
     # Generic SQL → Script activity
     result_set = task.properties.get("result_set", "None")
     # ResultSet values: None=0/None, SingleRow=1, Full=2, XML=3
-    return {
+    activity = {
         "type": "Script",
         "typeProperties": {
             "scripts": [
@@ -129,30 +152,241 @@ def _convert_execute_sql(
             ],
             "logSettings": {"logDestination": "ActivityOutput"},
         },
-        "externalReferences": {"connection": conn_id},
+        **_conn_ref(conn_id),
         "description": (
             f"Converted from SSIS Execute SQL Task. "
             f"Original ResultSet type: {result_set}. "
             + ("Result set capture must be wired manually via pipeline variables." if result_set not in ("0", "None", "") else "")
         ),
     }
+    if not conn_resolved:
+        activity.update(_INACTIVE)
+        activity["description"] += "  [InActive: connection could not be resolved — bind it in the Fabric UI.]"
+    return activity
+
+
+def _split_table(qualified: str) -> Tuple[str, str]:
+    """Split a possibly-qualified ``[schema].[table]`` name into (schema, table).
+
+    Falls back to a ``dbo`` schema when no schema component is present.
+    """
+    raw = (qualified or "").strip()
+    if not raw:
+        return "dbo", ""
+    parts = re.findall(r"\[([^\]]+)\]", raw)
+    if not parts:
+        parts = [p.strip() for p in raw.split(".") if p.strip()]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    if len(parts) == 1:
+        return "dbo", parts[0]
+    return "dbo", raw
+
+
+def _copy_source_for(comp: Any, conn_id: str) -> Dict[str, Any]:
+    """Build a Copy activity source from an SSIS data-flow source component."""
+    cls = (comp.component_class or "").lower()
+    name = (comp.name or "").lower()
+    sql = comp.sql_command or comp.properties.get("SqlCommand") or ""
+    table = comp.table_name or comp.properties.get("OpenRowset") or ""
+    if "flatfile" in cls or "flat file" in name:
+        return {
+            "type": "DelimitedTextSource",
+            "storeSettings": {"type": "AzureBlobFSReadSettings", "recursive": True},
+            "datasetSettings": {
+                "annotations": [],
+                "type": "DelimitedText",
+                "typeProperties": {
+                    "location": {"type": "AzureBlobFSLocation"},
+                    "columnDelimiter": ",",
+                    "firstRowAsHeader": True,
+                },
+                "schema": [],
+                **_conn_ref(conn_id),
+            },
+        }
+    schema_name, table_name = _split_table(table)
+    # When a SQL query drives the source, the dataset table is unused; avoid the
+    # misleading TODO_TABLE placeholder in that case.
+    if not table and sql:
+        table_props: Dict[str, Any] = {}
+    else:
+        table_props = {"schema": schema_name, "table": table_name or "TODO_TABLE"}
+    source: Dict[str, Any] = {
+        "type": "SqlServerSource",
+        "datasetSettings": {
+            "annotations": [],
+            "type": "SqlServerTable",
+            "schema": [],
+            "typeProperties": table_props,
+            **_conn_ref(conn_id),
+        },
+    }
+    if sql:
+        source["sqlReaderQuery"] = sql
+    return source
+
+
+def _copy_sink_for(comp: Any, conn_id: str) -> Dict[str, Any]:
+    """Build a Copy activity sink from an SSIS data-flow destination component."""
+    cls = (comp.component_class or "").lower()
+    name = (comp.name or "").lower()
+    table = comp.table_name or comp.properties.get("OpenRowset") or ""
+    if "flatfile" in cls or "flat file" in name:
+        return {
+            "type": "DelimitedTextSink",
+            "storeSettings": {"type": "AzureBlobFSWriteSettings"},
+            "formatSettings": {"type": "DelimitedTextWriteSettings", "fileExtension": ".csv"},
+            "datasetSettings": {
+                "annotations": [],
+                "type": "DelimitedText",
+                "typeProperties": {
+                    "location": {"type": "AzureBlobFSLocation"},
+                    "columnDelimiter": ",",
+                    "firstRowAsHeader": True,
+                },
+                "schema": [],
+                **_conn_ref(conn_id),
+            },
+        }
+    return {
+        "type": "SqlServerSink",
+        "writeBehavior": "insert",
+        "datasetSettings": {
+            "annotations": [],
+            "type": "SqlServerTable",
+            "schema": [],
+            "typeProperties": {"schema": _split_table(table)[0], "table": _split_table(table)[1] or "TODO_TABLE"},
+            **_conn_ref(conn_id),
+        },
+    }
+
+
+def _convert_data_flow_copy(task: SSISDataFlow, conn_id_map: Dict[str, str]) -> Dict[str, Any]:
+    """Pure source→destination data flow → native Copy activity."""
+    sources = [c for c in task.components if _classify_component(c) == "source"]
+    destinations = [c for c in task.components if _classify_component(c) == "destination"]
+    src_comp = sources[0]
+    dst_comp = destinations[0]
+    src_conn = conn_id_map.get(src_comp.connection_ref or "", _DUMMY_CONNECTION_ID)
+    dst_conn = conn_id_map.get(dst_comp.connection_ref or "", _DUMMY_CONNECTION_ID)
+    resolved = src_conn != _DUMMY_CONNECTION_ID and dst_conn != _DUMMY_CONNECTION_ID
+
+    activity: Dict[str, Any] = {
+        "type": "Copy",
+        "typeProperties": {
+            "source": _copy_source_for(src_comp, src_conn),
+            "sink": _copy_sink_for(dst_comp, dst_conn),
+            "enableStaging": False,
+            "translator": {
+                "type": "TabularTranslator",
+                "typeConversion": True,
+                "typeConversionSettings": {
+                    "allowDataTruncation": True,
+                    "treatBooleanAsNumber": False,
+                },
+            },
+        },
+        "description": (
+            "Converted from SSIS Data Flow (pure source→destination) to a native Copy "
+            "activity. Review connection bindings, schema/table names, and column mappings."
+        ),
+    }
+    if not resolved:
+        activity.update(_INACTIVE)
+        activity["description"] += \
+            "  [InActive: source and/or sink connection could not be resolved.]"
+    return activity
 
 
 def _convert_data_flow(
     task: SSISDataFlow,
     df_id_map: Dict[str, str],       # ssis data flow id → fabric dataflow guid
     workspace_id: str,
+    conn_id_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """DataFlow task → RefreshDataFlow activity."""
+    """DataFlow task → Copy activity (pure copy) or RefreshDataflow activity."""
+    if is_copy_candidate(task):
+        return _convert_data_flow_copy(task, conn_id_map or {})
     fabric_df_id = df_id_map.get(task.id, "TODO_DATAFLOW_ID")
-    return {
-        "type": "RefreshDataFlow",
+    resolved = bool(fabric_df_id) and fabric_df_id not in (
+        "TODO_DATAFLOW_ID",
+        _DUMMY_CONNECTION_ID,
+    )
+    activity: Dict[str, Any] = {
+        "type": "RefreshDataflow",
         "typeProperties": {
             "dataflowId": fabric_df_id,
             "workspaceId": workspace_id,
             "notifyOption": "NoNotification",
             "dataflowType": "Dataflow",
         },
+    }
+    if not resolved:
+        activity.update(_INACTIVE)
+        activity["description"] = (
+            "Converted from SSIS Data Flow to a RefreshDataflow activity. "
+            "[InActive: the target Fabric Dataflow could not be resolved. Create the "
+            "Dataflow Gen2, then set this activity's dataflowId and mark it active.]"
+        )
+    return activity
+
+
+def _convert_expression_task(task: SSISTask) -> Dict[str, Any]:
+    """ExpressionTask → SetVariable activity.
+
+    SSIS Expression Tasks hold an assignment of the form
+    '@[User::Var] = <expression>'. We extract the target variable name. Simple
+    literal assignments (a quoted string or a number) are translated directly to
+    a Fabric ``SetVariable`` value and left active; anything that uses SSIS
+    functions/operators is left InActive with a TODO for manual translation,
+    since SSIS expression syntax differs from Fabric pipeline expressions.
+    """
+    raw = (task.properties.get("expression") or "").strip()
+    var_name = "TODO_VARIABLE"
+    value_expr = raw
+    m = re.match(r"\s*@\[?(?:User::)?([A-Za-z0-9_]+)\]?\s*=(?!=)\s*(.*)", raw, re.S)
+    if m:
+        var_name = m.group(1)
+        value_expr = m.group(2).strip()
+
+    # Try to recognise a simple literal so the activity can run as-is.
+    literal: Optional[str] = None
+    if value_expr:
+        candidate = value_expr.rstrip(";").strip()
+        str_lit = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', candidate)
+        if str_lit:
+            # SSIS escapes \" and \\ inside string literals; unescape them.
+            literal = str_lit.group(1).replace('\\"', '"').replace("\\\\", "\\")
+        elif re.fullmatch(r"-?\d+(?:\.\d+)?", candidate):
+            literal = candidate
+
+    if literal is not None and var_name != "TODO_VARIABLE":
+        return {
+            "type": "SetVariable",
+            "typeProperties": {
+                "variableName": var_name,
+                "value": literal,
+            },
+            "description": (
+                "Converted from SSIS Expression Task (literal assignment). "
+                f"Original: {raw}. Ensure '{var_name}' is declared as a pipeline variable."
+            ),
+        }
+
+    return {
+        "type": "SetVariable",
+        **_INACTIVE,
+        "typeProperties": {
+            "variableName": var_name,
+            "value": f"TODO: translate SSIS expression -> {value_expr}" if value_expr else "",
+        },
+        "description": (
+            "Converted from SSIS Expression Task. "
+            f"Original: {raw or '(no expression captured)'}. "
+            "Translate the SSIS expression to a Fabric pipeline expression and ensure "
+            "the target variable is declared as a pipeline variable."
+        ),
     }
 
 
@@ -170,7 +404,6 @@ def _convert_script_task(task: SSISTask) -> Dict[str, Any]:
             "scripts": [{"type": "Query", "text": comment}],
             "logSettings": {"logDestination": "ActivityOutput"},
         },
-        "externalReferences": {"connection": _DUMMY_CONNECTION_ID},
     }
 
 
@@ -226,7 +459,6 @@ def _convert_send_mail(task: SSISTask) -> Dict[str, Any]:
         "type": "Office365Email",
         **_INACTIVE,   # Wire up an Office 365 connection in the Fabric pipeline editor
         "typeProperties": type_props,
-        "externalReferences": {"connection": _DUMMY_CONNECTION_ID},
     }
 
 
@@ -263,7 +495,6 @@ def _convert_execute_process(task: SSISTask) -> Dict[str, Any]:
             "method": "POST",
             "body": json.dumps({"executable": executable, "arguments": args}),
         },
-        "externalReferences": {"connection": _DUMMY_CONNECTION_ID},
     }
 
 
@@ -286,7 +517,6 @@ def _convert_file_system(task: SSISTask) -> Dict[str, Any]:
             ],
             "logSettings": {"logDestination": "ActivityOutput"},
         },
-        "externalReferences": {"connection": _DUMMY_CONNECTION_ID},
     }
 
 
@@ -360,7 +590,7 @@ def _convert_web_service_task(task: SSISTask, conn_id_map: Dict[str, str]) -> Di
             },
             "body": soap_placeholder,
         },
-        "externalReferences": {"connection": conn_id},
+        **_conn_ref(conn_id),
         "description": description,
     }
 
@@ -504,7 +734,7 @@ def _convert_ftp_task(task: SSISTask, conn_id_map: Dict[str, str]) -> Dict[str, 
             ],
             "logSettings": {"logDestination": "ActivityOutput"},
         },
-        "externalReferences": {"connection": conn_id},
+        **_conn_ref(conn_id),
     }
 
 
@@ -628,7 +858,7 @@ def _convert_sequence_container(
     return {
         "type": "IfCondition",
         "typeProperties": {
-            "expression": {"value": "@bool(1)", "type": "Expression"},
+            "expression": {"value": "@equals(1,1)", "type": "Expression"},
             "ifTrueActivities": inner_activities,
             "ifFalseActivities": [],
         },
@@ -657,7 +887,7 @@ def _convert_single_task(
     }
 
     if isinstance(task, SSISDataFlow):
-        activity.update(_convert_data_flow(task, df_id_map, workspace_id))
+        activity.update(_convert_data_flow(task, df_id_map, workspace_id, conn_id_map))
     elif isinstance(task, SSISForLoop):
         activity.update(
             _convert_for_loop(task, precedence_constraints, conn_id_map, df_id_map, workspace_id)
@@ -697,6 +927,8 @@ def _convert_single_task(
             activity.update(_convert_web_service_task(task, conn_id_map))
         elif tt == "FTP":
             activity.update(_convert_ftp_task(task, conn_id_map))
+        elif tt == "Expression":
+            activity.update(_convert_expression_task(task))
         elif tt == "ForEachLoop":
             # Handled above via SSISForEachLoop class, but just in case
             activity.update({"type": "Wait", **_INACTIVE, "typeProperties": {"waitTimeInSeconds": 1}})
@@ -752,6 +984,46 @@ def _convert_task_list(
 # Build pipeline-content.json
 # ---------------------------------------------------------------------------
 
+_ASSIGN_TARGET_RE = re.compile(r"\s*@\[?(?:User::)?([A-Za-z0-9_]+)\]?\s*=(?!=)")
+
+
+def _collect_written_variable_names(tasks: List[Any]) -> set:
+    """Return the set of User variable names that are *written* somewhere.
+
+    Written variables become mutable Fabric pipeline variables; read-only ones
+    become pipeline parameters. Sources of writes: For Loop init/assign
+    expressions, Expression Tasks, and ForEach iterator variables.
+    """
+    written: set = set()
+
+    def _target(expr: Optional[str]) -> None:
+        if not expr:
+            return
+        m = _ASSIGN_TARGET_RE.match(expr)
+        if m:
+            written.add(m.group(1))
+
+    def _walk(tlist: List[Any]) -> None:
+        for t in tlist:
+            if isinstance(t, SSISForLoop):
+                _target(t.init_expression)
+                _target(t.assign_expression)
+                _walk(t.tasks)
+            elif isinstance(t, SSISForEachLoop):
+                if t.variable_name:
+                    seg = re.split(r"[:\\/]", t.variable_name)[-1].strip()
+                    if seg:
+                        written.add(seg)
+                _walk(t.tasks)
+            elif isinstance(t, SSISSequenceContainer):
+                _walk(t.tasks)
+            elif isinstance(t, SSISTask) and t.task_type == "Expression":
+                _target(t.properties.get("expression"))
+
+    _walk(tasks)
+    return written
+
+
 def build_pipeline_content(
     package: SSISPackage,
     conn_id_map: Dict[str, str],   # ssis cm name/id → fabric connection guid
@@ -776,8 +1048,12 @@ def build_pipeline_content(
         workspace_id,
     )
 
-    # SSIS User-namespace variables → Fabric pipeline parameters
+    # SSIS User-namespace variables → Fabric pipeline parameters or variables.
+    # Variables that are written somewhere (For Loop counters, Expression Task
+    # targets, ForEach iterator variables) become mutable Fabric pipeline
+    # variables; read-only ones become pipeline parameters.
     # System variables (PackageName, StartTime, etc.) are runtime-only; skip them.
+    written_vars = _collect_written_variable_names(package.tasks)
     _type_map = {
         "String": "string", "DateTime": "string",   # Fabric has no native datetime param
         "Int32": "int", "Int64": "int", "Short": "int", "SByte": "int",
@@ -787,9 +1063,21 @@ def build_pipeline_content(
         "Object": "object",
     }
     parameters: Dict[str, Any] = {}
+    variables: Dict[str, Any] = {}
     for var in package.variables:
         if var.namespace.lower() == "system":
             continue   # runtime-provided; no Fabric equivalent
+        if var.name in written_vars:
+            # Mutable pipeline variable (Fabric supports String / Boolean / Array)
+            vtype = "Boolean" if var.data_type == "Boolean" else "String"
+            vdef: Dict[str, Any] = {"type": vtype}
+            if var.value is not None:
+                if vtype == "Boolean":
+                    vdef["defaultValue"] = str(var.value).lower() in ("true", "1", "yes")
+                else:
+                    vdef["defaultValue"] = str(var.value)
+            variables[var.name] = vdef
+            continue
         fabric_type = _type_map.get(var.data_type, "string")
         param: Dict[str, Any] = {"type": fabric_type}
         if var.value is not None:
@@ -818,6 +1106,8 @@ def build_pipeline_content(
     }
     if parameters:
         content["properties"]["parameters"] = parameters
+    if variables:
+        content["properties"]["variables"] = variables
     return content
 
 

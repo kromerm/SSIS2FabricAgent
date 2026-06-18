@@ -18,9 +18,16 @@ Usage
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# 8-4-4-4-12 hex-digit GUID, e.g. 12c5e906-5bfc-4ba4-bd76-c1ce68fc53c8
+_GUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 # Ensure UTF-8 output on Windows consoles that default to cp1252
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
@@ -101,6 +108,9 @@ def run(
     output_dir: Optional[str],
     create_connections: bool,
     create_dataflows_flag: bool,
+    tenant_id: Optional[str] = None,
+    use_device_code: bool = False,
+    use_service_principal: bool = False,
 ) -> None:
     # ------------------------------------------------------------------ Parse
     _print_section(f"Parsing DTSX: {dtsx_path}")
@@ -155,14 +165,26 @@ def run(
 
     # ---------------------------------------------------------------- Fabric client
     print("")
-    print("  Authenticating with Microsoft Fabric (interactive browser login)…")
+    if use_service_principal:
+        auth_mode = "service principal"
+    elif use_device_code:
+        auth_mode = "device code"
+    else:
+        auth_mode = "interactive browser"
+    tenant_note = f" (tenant {tenant_id})" if tenant_id else ""
+    print(f"  Authenticating with Microsoft Fabric ({auth_mode} login){tenant_note}…")
     try:
         from .fabric.client import FabricClient, FabricAPIError
     except ImportError as e:
         print(f"[ERROR] Could not import Fabric client: {e}", file=sys.stderr)
         sys.exit(1)
 
-    client = FabricClient(verbose=verbose)
+    client = FabricClient(
+        verbose=verbose,
+        tenant_id=tenant_id,
+        use_device_code=use_device_code,
+        use_service_principal=use_service_principal,
+    )
 
     # Test auth early
     try:
@@ -183,6 +205,13 @@ def run(
         _print_section("Creating Fabric Connections")
         for desc in conn_descriptors:
             name = desc["ssis_name"]
+            if not desc.get("supported", True):
+                conn_id_map[desc["ssis_id"]] = "00000000-0000-0000-0000-000000000000"
+                conn_id_map[name] = "00000000-0000-0000-0000-000000000000"
+                reason = desc.get("unsupported_reason") or "not supported as a cloud connection."
+                print(f"  Skipping connection: {name}  ({reason})")
+                print(f"  [warn] Using placeholder connection ID for '{name}'")
+                continue
             print(f"  Creating connection: {name} …", end="", flush=True)
             try:
                 result = client.create_connection(desc["payload"])
@@ -291,6 +320,20 @@ def main() -> None:
         help="Target Fabric workspace GUID.",
     )
     parser.add_argument(
+        "--tenant", default=None, dest="tenant_id",
+        help="Microsoft Entra tenant ID to authenticate against "
+             "(use this when the workspace is in a non-default/personal tenant).",
+    )
+    parser.add_argument(
+        "--device-code", action="store_true", dest="device_code",
+        help="Use device-code login instead of the interactive browser flow.",
+    )
+    parser.add_argument(
+        "--service-principal", action="store_true", dest="service_principal",
+        help="Authenticate with a service principal. Requires --tenant plus "
+             "AZURE_CLIENT_ID and AZURE_CLIENT_SECRET environment variables.",
+    )
+    parser.add_argument(
         "--folder", default=None, dest="folder",
         help="Optional folder name inside the workspace to place items.",
     )
@@ -326,9 +369,19 @@ def main() -> None:
         print(f"[ERROR] DTSX file not found: {dtsx_path}", file=sys.stderr)
         sys.exit(1)
 
+    # Validate the workspace GUID early — a malformed ID yields an opaque
+    # 400 BadRequest from Fabric that is hard to diagnose.
+    if not _GUID_RE.match(args.workspace_id.strip()):
+        print(
+            f"[ERROR] --workspace-id '{args.workspace_id}' is not a valid GUID "
+            "(expected 8-4-4-4-12 hex digits).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     run(
         dtsx_path=dtsx_path,
-        workspace_id=args.workspace_id,
+        workspace_id=args.workspace_id.strip(),
         folder_name=args.folder,
         pipeline_name=args.pipeline_name,
         dry_run=args.dry_run,
@@ -336,6 +389,9 @@ def main() -> None:
         output_dir=args.output_dir,
         create_connections=not args.no_connections,
         create_dataflows_flag=not args.no_dataflows,
+        tenant_id=args.tenant_id,
+        use_device_code=args.device_code,
+        use_service_principal=args.service_principal,
     )
 
 

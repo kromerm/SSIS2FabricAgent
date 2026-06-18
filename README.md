@@ -7,10 +7,13 @@
 | SSIS artifact | Fabric artifact |
 |---|---|
 | Package control flow | **Data Pipeline** |
-| Data Flow task | **Dataflow Gen2** (Power Query M) |
-| Connection Manager | **Fabric Shareable Connection** |
+| Data Flow task (pure source→destination) | **Copy activity** inside the pipeline |
+| Data Flow task (with transforms) | **Dataflow Gen2** (Power Query M) |
+| Connection Manager (package- *and* project-level) | **Fabric Shareable Connection** |
 
 Activities that cannot be fully auto-converted are created with **`state: InActive`** so the pipeline can still be saved and opened in Fabric — they just need follow-up manual editing.
+
+> **Project-level connections:** Many real-world packages reference connection managers defined in separate project `.conmgr` files (e.g. `Project.ConnectionManagers[WWI_Source_DB]`) rather than inside the `.dtsx`. `ssis2fabric` detects these external references and synthesizes named Fabric connections for them so activities are wired to real connections instead of placeholders.
 
 ---
 
@@ -205,10 +208,13 @@ The token is cached in memory for the duration of the run.
 | SSIS Task | Fabric Activity | Notes |
 |---|---|---|
 | Execute SQL Task | `Script` or `SqlServerStoredProcedure` | SP name detected automatically |
-| Data Flow Task | `RefreshDataFlow` | References the Dataflow Gen2 created for that task |
+| Data Flow Task (pure source→destination) | `Copy` | Native Copy activity; source/sink tables and connections wired automatically |
+| Data Flow Task (with transforms) | `RefreshDataflow` | References the Dataflow Gen2 created for that task |
+| Expression Task (literal assignment) | `SetVariable` | Simple `@[User::Var] = "literal"` / number assignments are translated and left active |
+| Expression Task (function-based) | `SetVariable` | ⚠ Set InActive – SSIS function expressions must be translated to Fabric syntax |
 | ForEach Loop | `ForEach` | Inner tasks recursively converted |
 | For Loop Container | `Until` | ⚠ Set InActive – loop expressions converted to TODO placeholder (SSIS expression syntax differs from Fabric) |
-| Sequence Container | `IfCondition` (always-true wrapper) | Inner tasks recursively converted |
+| Sequence Container | `IfCondition` (always-true `@equals(1,1)` wrapper) | Inner tasks recursively converted |
 | Execute Package Task | `ExecutePipeline` | ⚠ Set InActive – referenced pipeline may not exist yet |
 | Script Task | `Script` | ⚠ Set InActive – logic must be manually ported |
 | Send Mail Task | `Office365Email` | ⚠ Set InActive – connection required; fields From/To/CC/BCC/Subject/Body/Priority/Attachments populated |
@@ -224,7 +230,7 @@ The token is cached in memory for the duration of the run.
 
 > **Disabled tasks:** Any SSIS task with `DTS:Disabled="True"` is emitted with `state: InActive` and its description prefixed with `[Disabled in original SSIS package]`.
 
-> **SSIS Variables → Pipeline Parameters:** `User::` namespace variables are converted to Fabric pipeline parameters (type mapping: String/DateTime → `string`, Int32/Int64 → `int`, Double/Decimal → `float`, Boolean → `bool`). `System::` variables are skipped.
+> **SSIS Variables → Pipeline Parameters / Variables:** `User::` namespace variables that are *written* somewhere (Expression Task targets, For Loop counters, ForEach iterators) become mutable Fabric pipeline **variables**; read-only ones become pipeline **parameters** (type mapping: String/DateTime → `string`, Int32/Int64 → `int`, Double/Decimal → `float`, Boolean → `bool`). `System::` variables are skipped.
 
 ### Data Flow → Dataflow Gen2 (Power Query M)
 
@@ -260,7 +266,9 @@ SSIS connection types are mapped to Fabric connectivity types:
 | FTP | FTP |
 | SMTP / others | SQL (dummy) |
 
-Connections are created with **`skipTestConnection: true`** and dummy/placeholder credentials so the API call succeeds.  **Credentials must be updated in Fabric after migration.**
+Connections are created as **`ShareableCloud`** connections with dummy/placeholder credentials so the API call succeeds.  **Server, database, and credentials must be updated in Fabric after migration** — this is especially true for synthesized project-level connections, whose real server/database live in the original `.conmgr` files and are emitted as `TODO` placeholders.
+
+> **File connections** reference local paths that are unreachable from cloud Fabric, so they are marked unsupported and the activity receives a placeholder connection ID (configure an on-premises data gateway manually).
 
 ---
 

@@ -75,11 +75,62 @@ def _child_text(elem: ET.Element, tag: str) -> Optional[str]:
     return None
 
 
+def _local_attrs(elem: ET.Element) -> Dict[str, str]:
+    """Return an element's attributes keyed by local name (namespace stripped).
+
+    Real SSIS task data is namespaced (e.g. SendMailTask:To, or attributes on a
+    default-namespaced WebServiceTaskData element), so matching on the bare local
+    name lets us read both the authentic and the simplified scaffold forms.
+    """
+    out: Dict[str, str] = {}
+    for key, val in elem.attrib.items():
+        local = key.split("}")[-1]
+        out[local] = val
+    return out
+
+
+def _find_by_localname(parent: ET.Element, *local_names: str) -> Optional[ET.Element]:
+    """Find the first descendant whose tag local name matches one of *local_names*."""
+    wanted = set(local_names)
+    for el in parent.iter():
+        if el.tag.split("}")[-1] in wanted:
+            return el
+    return None
+
+
 def _clean_id(raw: Optional[str]) -> str:
     """Strip braces from GUID-style IDs."""
     if not raw:
         return ""
     return raw.strip("{}")
+
+
+# Project-level connection references look like
+#   connectionManagerRefId="Project.ConnectionManagers[WWI_Source_DB]"
+# or, on package scope, "Package.ConnectionManagers[Foo]".
+_PROJECT_CONN_RE = re.compile(
+    r"(?:Project|Package)\.ConnectionManagers\[(?P<name>[^\]]+)\]"
+)
+
+# Scope suffixes that SSIS appends to a connection GUID, e.g.
+#   connectionManagerID="{GUID}:external"
+_CONN_SCOPE_SUFFIXES = ("external", "internal", "package", "project")
+
+
+def _normalize_conn_ref(raw: Optional[str]) -> Optional[str]:
+    """Normalize a connection reference to a bare GUID/name.
+
+    Handles forms such as ``{GUID}:external`` (project connection managers
+    defined in a separate .conmgr file) by stripping the scope suffix and the
+    surrounding braces.
+    """
+    if not raw:
+        return None
+    val = raw.strip()
+    head, sep, tail = val.rpartition(":")
+    if sep and tail.lower() in _CONN_SCOPE_SUFFIXES:
+        val = head
+    return val.strip("{} ").strip() or None
 
 
 def _task_type_from_ref(creation_name: str) -> str:
@@ -174,10 +225,26 @@ def _parse_connection_manager(cm_elem: ET.Element) -> SSISConnectionManager:
         if file_elem is not None:
             file_path = _attr(file_elem, "FileUsageType") or props.get("ConnectionString")
 
-        # HTTP connection
-        http_elem = obj_data.find(f".//{_DTS}HttpConnectionManager")
+        # HTTP connection: SSDT/BIDS serializes the server URL as a
+        # DTS:ServerURL attribute on an inner <DTS:HttpConnection> element and
+        # mirrors the same URL as DTS:ConnectionString on the wrapping inner
+        # <DTS:ConnectionManager>. The only <DTS:Property> children are the
+        # encrypted ServerPassword / ProxyPassword blobs -- the URL is NOT a
+        # ServerURL property element. Read the authentic attribute first, then
+        # fall back to the ConnectionString and (for hand-authored fixtures) a
+        # ServerURL property element.
+        http_elem = _find_by_localname(obj_data, "HttpClientConnection", "HttpConnection", "HttpConnectionManager")
         if http_elem is not None:
-            url = _attr(http_elem, "ServerURL")
+            url = (
+                http_elem.get(f"{_DTS}ServerURL")
+                or http_elem.get("ServerURL")
+                or _local_attrs(http_elem).get("ServerURL")
+                or _prop_text(http_elem, "ServerURL")
+                or props.get("ServerURL")
+                or conn_str
+            )
+        elif conn_type == "HTTP" and conn_str:
+            url = conn_str
 
     return SSISConnectionManager(
         id=cm_id,
@@ -255,11 +322,14 @@ def _parse_data_flow(task_elem: ET.Element, task_id: str, task_name: str) -> SSI
                 # Properties
                 for prop in comp.iter("property"):
                     pname = prop.get("name") or ""
+                    ptext = (prop.text or "").strip()
                     props[pname] = prop.text or ""
-                    if "SqlCommand" in pname:
-                        sql_cmd = prop.text
-                    if "TableName" in pname or "OpenRowset" in pname:
-                        table_name = prop.text
+                    # Only the exact SqlCommand / table props carry the value;
+                    # the *Variable variants are empty and must not overwrite it.
+                    if pname == "SqlCommand" and ptext:
+                        sql_cmd = ptext
+                    if pname in ("OpenRowset", "TableName", "TableOrViewName") and ptext:
+                        table_name = ptext
 
                 # Connection managers – tag may be 'connectionManager' (new) or 'connection' (old)
                 for tag_name in ("connectionManager", "connection"):
@@ -269,8 +339,17 @@ def _parse_data_flow(task_elem: ET.Element, task_id: str, task_name: str) -> SSI
                             or cm_ref.get("connectionManagerId")
                             or cm_ref.get("name")
                         )
+                        ref_id = cm_ref.get("connectionManagerRefId")
                         if cr:
-                            conn_ref = _clean_id(cr)
+                            conn_ref = _normalize_conn_ref(cr)
+                            # Capture the friendly project connection name so the
+                            # synthesized connection manager can be named properly.
+                            if ref_id and conn_ref:
+                                m = _PROJECT_CONN_RE.search(ref_id)
+                                if m:
+                                    props.setdefault(
+                                        f"__conn_name__{conn_ref}", m.group("name")
+                                    )
                             break
                     if conn_ref:
                         break
@@ -461,7 +540,7 @@ def _parse_task(exec_elem: ET.Element) -> Any:
                 props["sql_statement"] = sql
             conn = sql_task_node.get(f"{{{NS['SQLTask']}}}Connection")
             if conn:
-                connection_ref = _clean_id(conn)
+                connection_ref = _normalize_conn_ref(conn)
             sp = sql_task_node.get(f"{{{NS['SQLTask']}}}StoredProcedureName")
             if sp:
                 props["stored_procedure_name"] = sp
@@ -474,22 +553,24 @@ def _parse_task(exec_elem: ET.Element) -> Any:
         if script_elem is not None:
             props["script_language"] = _attr(script_elem, "Language") or "CSharp"
 
-        # SendMail
-        mail_elem = obj_data.find(f".//{_DTS}SendMailTask")
-        if mail_elem is None:
-            mail_elem = obj_data.find(".//SendMailData")
+        # SendMail (authentic: SendMailTask:SendMailTaskData with namespaced
+        # attrs; also accepts DTS:SendMailTask or a bare SendMailData scaffold)
+        mail_elem = _find_by_localname(
+            obj_data, "SendMailTaskData", "SendMailTask", "SendMailData"
+        )
         if mail_elem is not None:
-            props["to"] = mail_elem.get("To") or ""
-            props["from"] = mail_elem.get("From") or ""
-            props["cc"] = mail_elem.get("CC") or ""
-            props["bcc"] = mail_elem.get("BCC") or ""
-            props["subject"] = mail_elem.get("Subject") or ""
+            a = _local_attrs(mail_elem)
+            props["to"] = a.get("To", "")
+            props["from"] = a.get("From", "")
+            props["cc"] = a.get("CC", "")
+            props["bcc"] = a.get("BCC", "")
+            props["subject"] = a.get("Subject", "")
             # MessageSourceType: DirectInput=0, FileConnection=1, Variable=2
-            props["message_source_type"] = mail_elem.get("MessageSourceType") or "DirectInput"
-            props["message"] = mail_elem.get("MessageSource") or mail_elem.get("MessageBody") or ""
+            props["message_source_type"] = a.get("MessageSourceType", "DirectInput")
+            props["message"] = a.get("MessageSource") or a.get("MessageBody") or ""
             # Priority: Normal=0, High=1, Low=2
-            props["priority"] = mail_elem.get("Priority") or "Normal"
-            props["attachments"] = mail_elem.get("FileAttachments") or ""
+            props["priority"] = a.get("Priority", "Normal")
+            props["attachments"] = a.get("FileAttachments", "")
         # Also pick up SendMail properties stored as DTS:Property elements
         # (some versions of the DTSX schema embed them this way)
         for prop in obj_data.iter(f"{_DTS}Property"):
@@ -505,18 +586,30 @@ def _parse_task(exec_elem: ET.Element) -> Any:
                 mapped = key_map.get(pname, pname.lower())
                 props.setdefault(mapped, prop.text or "")
 
-        # Web Service Task
-        ws_elem = obj_data.find(f".//{_DTS}WebServiceTask")
-        if ws_elem is None:
-            ws_elem = obj_data.find(".//WebServiceTaskData")
+        # Web Service Task (authentic: WebServiceTaskData in the webservicetask
+        # namespace with a child <ServiceInfo>; also accepts a bare scaffold form)
+        ws_elem = _find_by_localname(obj_data, "WebServiceTaskData", "WebServiceTask")
         if ws_elem is not None:
-            props["wsdl_file"] = ws_elem.get("WSDLFile") or ""
-            props["service"]   = ws_elem.get("Service") or ""
-            props["web_method"]= ws_elem.get("WebMethod") or ""
-            props["output_type"] = ws_elem.get("OutputType") or ""  # Variable or File
-            props["output"]    = ws_elem.get("Output") or ""
-            # Connection ref for the HTTP connection manager
-            http_conn = ws_elem.get("Connection") or ws_elem.get("HTTPConnection")
+            a = _local_attrs(ws_elem)
+            props["wsdl_file"] = a.get("WsdlFile") or a.get("WSDLFile") or ""
+            props["output_type"] = a.get("OutputType", "")  # Variable or File
+            props["output"] = a.get("OutPutLocation") or a.get("Output") or ""
+            # Service / method may be attributes (scaffold) or a child ServiceInfo
+            service = a.get("Service", "")
+            web_method = a.get("WebMethod", "")
+            svc_info = _find_by_localname(ws_elem, "ServiceInfo")
+            if svc_info is not None:
+                sa = _local_attrs(svc_info)
+                service = service or sa.get("ServiceName") or sa.get("Service") or ""
+                web_method = web_method or sa.get("MethodName") or sa.get("Method") or ""
+            props["service"] = service
+            props["web_method"] = web_method
+            # Connection ref for the HTTP connection manager (by name or id)
+            http_conn = (
+                a.get("ConnectionName")
+                or a.get("Connection")
+                or a.get("HTTPConnection")
+            )
             if http_conn and not connection_ref:
                 connection_ref = _clean_id(http_conn)
 
@@ -560,6 +653,28 @@ def _parse_task(exec_elem: ET.Element) -> Any:
             ftp_conn = _ftp("Connection")
             if ftp_conn and not connection_ref:
                 connection_ref = _clean_id(ftp_conn)
+
+        # Expression Task (namespace: www.microsoft.com/sqlserver/dts/tasks/expressiontask)
+        # The assignment expression is stored as the text of an <ExpressionTask>
+        # element (or, in some schema versions, as an 'Expression' property).
+        if task_type == "Expression":
+            expr_text = None
+            for _el in obj_data.iter():
+                tag = _el.tag
+                if tag.endswith("}ExpressionTask") or tag == "ExpressionTask" \
+                        or tag.endswith("}Expression") or tag == "Expression":
+                    # The assignment may be element text OR an 'Expression' attribute.
+                    if _el.text and _el.text.strip():
+                        expr_text = _el.text.strip()
+                        break
+                    attr_expr = _el.get("Expression") or _el.get("expression")
+                    if attr_expr and attr_expr.strip():
+                        expr_text = attr_expr.strip()
+                        break
+            if not expr_text:
+                expr_text = props.get("Expression") or _attr(exec_elem, "Expression")
+            if expr_text:
+                props["expression"] = expr_text
 
         # Generic property bag
         for prop in obj_data.iter(f"{_DTS}Property"):
@@ -659,6 +774,54 @@ def parse_dtsx(path: str) -> SSISPackage:
     # Old format: direct children
     for pc in root.findall(f"{_DTS}PrecedenceConstraint"):
         precedence_constraints.append(_parse_precedence_constraint(pc))
+
+    # ---- Synthesize project-level (external) connection managers ----
+    # Real-world SSIS packages reference project connections that are defined in
+    # separate .conmgr files (not embedded in the DTSX). Those references appear
+    # as connectionManagerID="{GUID}:external" with a friendly
+    # connectionManagerRefId="Project.ConnectionManagers[NAME]", or as a bare
+    # SQLTask:Connection GUID. Without the .conmgr definition the parser finds
+    # zero connections; we synthesize descriptors so the converter can emit named
+    # connections and wire activities to them instead of dummy IDs.
+    proj_conn_names: Dict[str, str] = {}   # guid -> friendly name
+    referenced_guids: List[str] = []
+
+    def _note_ref(guid: Optional[str]) -> None:
+        if guid and guid not in referenced_guids:
+            referenced_guids.append(guid)
+
+    for el in root.iter():
+        cm_id = el.get("connectionManagerID") or el.get("connectionManagerId")
+        ref_id = el.get("connectionManagerRefId")
+        if cm_id:
+            guid = _normalize_conn_ref(cm_id)
+            _note_ref(guid)
+            if guid and ref_id:
+                m = _PROJECT_CONN_RE.search(ref_id)
+                if m:
+                    proj_conn_names[guid] = m.group("name")
+        # Execute SQL tasks reference the connection via a namespaced attribute.
+        sql_conn = el.get(f"{{{NS['SQLTask']}}}Connection")
+        if sql_conn:
+            _note_ref(_normalize_conn_ref(sql_conn))
+
+    existing_ids = {cm.id for cm in connection_managers if cm.id}
+    existing_names = {cm.name for cm in connection_managers if cm.name}
+    for guid in referenced_guids:
+        if guid in existing_ids:
+            continue
+        name = proj_conn_names.get(guid) or f"ProjectConnection_{guid[:8]}"
+        if name in existing_names:
+            continue
+        existing_names.add(name)
+        # WWI-style project connections are SQL Server (OLE DB) connections; the
+        # actual server/database live in the .conmgr file, so emit placeholders.
+        _add_cm(SSISConnectionManager(
+            id=guid,
+            name=name,
+            connection_type="OLEDB",
+            properties={"projectLevel": "true", "synthesized": "true"},
+        ))
 
     # ---- Collect all DataFlow objects from tasks list ----
     data_flows: List[SSISDataFlow] = []

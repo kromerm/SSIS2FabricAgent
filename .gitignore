@@ -18,6 +18,9 @@ dry_out/
 dry_pkg/
 output_sample/
 sample/
+deploy_*/
+dry_*/
+*.log
 
 # SSIS test packages (not part of the tool itself)
 *.dtsx

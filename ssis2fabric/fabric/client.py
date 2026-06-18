@@ -25,6 +25,7 @@ Key endpoints used
 """
 import json
 import time
+import os
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -58,14 +59,51 @@ class FabricClient:
     Thin wrapper around the Fabric REST API, authenticating as the current user.
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(
+        self,
+        verbose: bool = False,
+        tenant_id: Optional[str] = None,
+        use_device_code: bool = False,
+        use_service_principal: bool = False,
+    ):
         if not _HAS_AZURE_IDENTITY:
             raise FabricAuthError(
                 "azure-identity is required for user authentication. "
                 "Run: pip install azure-identity"
             )
         self._verbose = verbose
-        self._credential = InteractiveBrowserCredential()
+        cred_kwargs: Dict[str, Any] = {}
+        if tenant_id:
+            cred_kwargs["tenant_id"] = tenant_id
+        if use_service_principal:
+            from azure.identity import ClientSecretCredential
+            sp_tenant = tenant_id or os.environ.get("AZURE_TENANT_ID")
+            client_id = os.environ.get("AZURE_CLIENT_ID")
+            client_secret = os.environ.get("AZURE_CLIENT_SECRET")
+            missing = [
+                name for name, val in (
+                    ("--tenant / AZURE_TENANT_ID", sp_tenant),
+                    ("AZURE_CLIENT_ID", client_id),
+                    ("AZURE_CLIENT_SECRET", client_secret),
+                ) if not val
+            ]
+            if missing:
+                raise FabricAuthError(
+                    "Service-principal auth requires: "
+                    + ", ".join(missing)
+                    + ". Set the AZURE_CLIENT_ID and AZURE_CLIENT_SECRET "
+                    "environment variables (and pass --tenant)."
+                )
+            self._credential = ClientSecretCredential(
+                tenant_id=sp_tenant,
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+        elif use_device_code:
+            from azure.identity import DeviceCodeCredential
+            self._credential = DeviceCodeCredential(**cred_kwargs)
+        else:
+            self._credential = InteractiveBrowserCredential(**cred_kwargs)
         self._token_cache: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -187,7 +225,7 @@ class FabricClient:
             if location:
                 return self._poll_lro(location)
         # Item name already in use — find existing item and return it
-        if resp.status_code == 400:
+        if resp.status_code in (400, 409):
             try:
                 err = resp.json().get("errorCode", "")
             except Exception:
@@ -284,7 +322,7 @@ class FabricClient:
             err = resp.json().get("errorCode", "")
         except Exception:
             err = ""
-        if resp.status_code == 400 and "AlreadyInUse" in err:
+        if resp.status_code in (400, 409) and "AlreadyInUse" in err:
             existing = self.find_item_by_name(workspace_id, display_name, "Dataflow")
             if existing:
                 item_id = existing.get("id") or existing.get("objectId")

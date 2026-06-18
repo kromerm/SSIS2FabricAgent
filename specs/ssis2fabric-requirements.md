@@ -96,9 +96,10 @@
 | CONN-02 | File and Flat File connection managers MUST be converted to Fabric `File` connections. |
 | CONN-03 | HTTP connection managers MUST be converted to Fabric `Web (Anonymous)` connections. |
 | CONN-04 | FTP connection managers MUST be converted to Fabric `FTP` connections. |
-| CONN-05 | SMTP and unrecognised connection types MUST be converted to a dummy SQL connection with `skipTestConnection: true`. |
+| CONN-05 | SMTP and unrecognised connection types MUST be converted to a dummy SQL `ShareableCloud` connection. |
 | CONN-06 | All connections MUST be created with placeholder/dummy credentials. The user MUST update credentials in Fabric after migration. |
 | CONN-07 | Connection GUIDs returned by the Fabric API MUST be collected and passed to downstream pipeline/dataflow converters so that activities reference real connection IDs. |
+| CONN-08 | Project-level connection managers referenced by components (`Project.ConnectionManagers[NAME]` / `{GUID}:external`) but not defined in the `.dtsx` MUST be synthesized as named connection descriptors so that activities are wired to real connections rather than dummy placeholders. |
 
 ### 3.4 Data Flow → Dataflow Gen2 Conversion
 

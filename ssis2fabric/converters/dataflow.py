@@ -131,6 +131,10 @@ def _classify_component(comp: SSISDataFlowComponent) -> str:
     return "transform"
 
 
+# Public alias for use by the pipeline converter.
+classify_component = _classify_component
+
+
 def _m_string(val: Optional[str]) -> str:
     """Escape a value for use in a Power Query M string literal."""
     if not val:
@@ -179,8 +183,17 @@ def _source_to_m(
     # Build the connection expression from the linked connection manager
     conn_expr = _conn_expr(cm)
 
-    if "flatfile" in cls:
-        path = (cm.connection_string if cm else None) or comp.properties.get("ConnectionString") or "TODO_PATH"
+    # Detect a flat-file source either by component class name (new format) or by
+    # the linked connection manager type (old GUID-class format, where `cls` is a GUID).
+    cm_type = ((getattr(cm, "connection_type", "") or "").upper()) if cm else ""
+    is_flat_file = "flatfile" in cls or "FLAT" in cm_type or "FILE" in cm_type
+
+    if is_flat_file:
+        path = (
+            (cm.file_path or cm.connection_string if cm else None)
+            or comp.properties.get("ConnectionString")
+            or "TODO_PATH"
+        )
         return (
             f"    {safe_name} = \n"
             f"        // TODO: Replace with actual Fabric lakehouse or cloud path\n"
@@ -379,7 +392,9 @@ def dataflow_to_m(df: SSISDataFlow, conn_map: Optional[Dict[str, Any]] = None) -
     last_step = re.sub(r"[^A-Za-z0-9_]", "_", ordered[-1].name) if ordered else "Source"
     query_name = re.sub(r"[^A-Za-z0-9_]", "_", df.name) or "DataFlow"
 
-    steps_body = ",\n".join(steps)
+    # Separate let-bindings with the comma on its own line so that a trailing
+    # inline `// comment` on any step cannot swallow the separator.
+    steps_body = "\n    ,\n".join(steps)
     m_doc = (
         f"section Section1;\n\n"
         f"shared {query_name} = let\n"
@@ -446,13 +461,34 @@ def build_dataflow_definition(df: SSISDataFlow, conn_map: Optional[Dict[str, Any
     }
 
 
+def is_copy_candidate(df: SSISDataFlow) -> bool:
+    """True when the data flow is a pure source→destination move (no transforms).
+
+    Such flows are better represented as a native Fabric Copy activity than as a
+    Dataflow Gen2 full of TODO placeholders, so they are handled in the pipeline
+    converter and skipped here.
+    """
+    if not df.components:
+        return False
+    sources = [c for c in df.components if _classify_component(c) == "source"]
+    transforms = [c for c in df.components if _classify_component(c) == "transform"]
+    destinations = [c for c in df.components if _classify_component(c) == "destination"]
+    return len(transforms) == 0 and len(sources) == 1 and len(destinations) == 1
+
+
 def convert_dataflows(
     data_flows: List[SSISDataFlow],
     conn_map: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Return a list of Fabric Dataflow Gen2 creation descriptors."""
+    """Return a list of Fabric Dataflow Gen2 creation descriptors.
+
+    Pure source→destination flows are skipped — they become native Copy
+    activities in the pipeline converter instead.
+    """
     results = []
     for df in data_flows:
+        if is_copy_candidate(df):
+            continue
         results.append({
             "ssis_name": df.name,
             "ssis_id": df.id,
