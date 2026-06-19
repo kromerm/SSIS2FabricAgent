@@ -2,23 +2,35 @@
 name: ssis-migration
 description: >-
   Migrate SQL Server Integration Services (SSIS) .dtsx packages to Microsoft
-  Fabric Data Factory items using the ssis2fabric Python CLI in this repo. Parses
-  an SSIS package and creates an equivalent Fabric Data Pipeline, Dataflow Gen2
-  items, and Shareable Connections via the Fabric REST API. Tasks that cannot be
-  fully auto-converted are emitted as InActive placeholders so the pipeline still
-  saves and opens in Fabric for manual follow-up. Covers the dry-run review loop,
-  authentication modes (interactive, device code, service principal, non-default
-  tenant), connection-less pipeline shells, and the post-migration wiring
-  checklist.
-  WHEN: "migrate SSIS to Fabric", "convert a .dtsx", "port SSIS package to Fabric
-  Data Factory", "ssis2fabric", "turn my SSIS package into a Fabric pipeline",
-  "move SSIS control flow / data flow to Fabric", "deploy a converted SSIS
-  pipeline to a Fabric workspace", "dry-run an SSIS conversion".
-  Triggers: "ssis to fabric", "dtsx to fabric pipeline", "convert dtsx",
-  "ssis2fabric run", "fabric data factory migration", "ssis dataflow gen2".
-domain: ssis, dtsx, microsoft-fabric, data-factory, data-pipeline, dataflow-gen2, migration
-source: ssis2fabric repo (cli.py, parser.py, converters/*.py, fabric/client.py, README.md, specs/ssis2fabric-requirements.md)
+  Fabric Data Factory using the ssis2fabric Python CLI. Parses an SSIS package
+  and creates a Fabric Data Pipeline, Dataflow Gen2 items, and Shareable
+  Connections via the Fabric REST API; tasks that cannot be auto-converted become
+  InActive placeholders so the pipeline still saves and opens for manual fixup.
+  Supports dry-run review, auth modes (interactive, device code, service
+  principal), tenant override, and connection-less pipeline shells. Use when the
+  user wants to: (1) convert an SSIS .dtsx control flow into a Fabric Data
+  Pipeline, (2) translate SSIS Data Flow tasks into Dataflow Gen2 Power Query M
+  or Copy activities, (3) map SSIS connection managers to Fabric connections and
+  deploy the pipeline to a workspace, (4) dry-run and review a conversion before
+  touching Fabric. Triggers: "migrate SSIS to Fabric", "ssis to fabric", "convert
+  dtsx", "dtsx to fabric pipeline", "ssis2fabric", "port SSIS to Fabric Data
+  Factory", "ssis dataflow gen2".
 ---
+
+> **Update Check — ONCE PER SESSION (mandatory)**
+> The first time this skill is used in a session, run the **check-updates** skill before proceeding.
+> - **GitHub Copilot CLI / VS Code**: invoke the `check-updates` skill.
+> - **Claude Code / Cowork / Cursor / Windsurf / Codex**: compare local vs remote package.json version.
+> - Skip if the check was already performed earlier in this session.
+
+> **CRITICAL NOTES**
+> 1. To find a Fabric workspace ID from its name: list all workspaces, then JMESPath-filter by `displayName`.
+> 2. To find an item ID (pipeline / dataflow / connection): list items of that type in the workspace, then JMESPath-filter by name.
+> 3. **Always `--dry-run --output-dir` first** — it parses and converts with NO Fabric API calls and NO auth. Review the JSON before any live run.
+> 4. **Validate the `--workspace-id` GUID** (8-4-4-4-12). A malformed ID returns an opaque `400 BadRequest`.
+> 5. **Connections never carry credentials.** Real connections are created with placeholder creds (or omitted as connection-less shells); the user MUST wire server / database / credentials in Fabric afterward.
+> 6. **Non-default / personal tenants require `--tenant`**, or login defaults to the home tenant and workspace access fails.
+> 7. **InActive activities are expected** — they are the manual follow-up list, not a failure; the pipeline still deploys.
 
 # SSIS (.dtsx) → Microsoft Fabric Migration
 
@@ -49,23 +61,37 @@ the original SSIS task so an engineer can finish it by hand.
 
 ---
 
-## Golden rules
+## Prerequisite Knowledge
 
-1. **Always dry-run first.** `--dry-run --output-dir <dir>` parses, converts, and
-   writes the JSON artifacts locally with **no** Fabric API calls and **no**
-   authentication. Review the output before touching a live workspace.
-2. **Validate the workspace GUID.** A malformed `--workspace-id` yields an opaque
-   `400 BadRequest` from Fabric. The CLI pre-checks the 8-4-4-4-12 format.
-3. **Connections rarely migrate cleanly.** SSIS credentials are never carried
-   over. Connections are created with placeholder credentials (or omitted as
-   connection-less shells); the user **must** wire real server/database/
-   credentials in Fabric afterward. See
-   [connections-and-auth.md](resources/connections-and-auth.md).
-4. **Expect InActive activities.** Treat them as a TODO list, not a failure — the
-   pipeline still deploys. See
-   [post-migration-checklist.md](resources/post-migration-checklist.md).
-5. **Non-default / personal tenants need `--tenant`.** Without it, interactive
-   login defaults to the home tenant and workspace access fails.
+Unlike the `az rest`-based Fabric skills, `ssis-migration` drives a
+self-contained Python CLI that handles its own Microsoft Entra ID authentication
+(via `azure-identity`) and all Fabric REST calls. There is therefore no
+dependency on the shared `common/*-CORE.md` auth/CLI recipes. Reference material
+lives in-repo:
+
+- [README.md](../../README.md) — full tool usage, options, and SSIS→Fabric mapping tables.
+- [specs/ssis2fabric-requirements.md](../../specs/ssis2fabric-requirements.md) — the product requirements / behavior contract.
+- Source of truth for mappings: `ssis2fabric/parser.py`, `ssis2fabric/converters/*.py`, `ssis2fabric/fabric/client.py`.
+
+---
+
+## Must / Prefer / Avoid
+
+### MUST DO
+- **Dry-run first.** Run `--dry-run --output-dir <dir>`, read the package summary, and inspect the generated JSON before any live deploy.
+- **Validate the workspace GUID** (8-4-4-4-12) before deploying; a malformed ID returns an opaque `400 BadRequest`.
+- **Keep `--output-dir` on live runs too**, so a failed pipeline create still leaves an importable `pipeline_<name>.json` on disk.
+- **Treat InActive activities and `// TODO` M steps as the post-migration checklist** — work [post-migration-checklist.md](resources/post-migration-checklist.md).
+
+### PREFER
+- **`--tenant <guid>`** whenever the workspace is in a non-default or personal tenant.
+- **`--device-code`** for headless / remote shells; **`--service-principal`** (with `--tenant` + `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`) for CI.
+- **`--no-dataflows`** to stabilize the control-flow pipeline first, then add dataflows; **`--no-connections`** when the target connections already exist in the workspace.
+
+### AVOID
+- **Don't hand-edit real connection GUIDs into the pipeline definition** — Fabric validates every GUID; let the tool emit connection-less shells instead (see [connections-and-auth.md](resources/connections-and-auth.md)).
+- **Don't commit `--verbose` logs** — they can contain auth tokens. If a service-principal secret is exposed, rotate it.
+- **Don't expect credentials to migrate** — they never do; wire them in Fabric afterward.
 
 ---
 
@@ -125,6 +151,38 @@ Full step-by-step commands, expected output, and decision points are in
 | `--output-dir DIR` | Save converted JSON artifacts locally. |
 | `--no-connections` | Skip connection creation (pipeline uses placeholder/omitted refs). |
 | `--no-dataflows` | Skip Dataflow Gen2 creation. |
+
+---
+
+## Examples
+
+**Dry-run review (no auth, no API calls):**
+
+```powershell
+.venv\Scripts\python.exe -m ssis2fabric `
+  --dtsx MyPackage.dtsx `
+  --workspace-id 12c5e906-5bfc-4ba4-bd76-c1ce68fc53c8 `
+  --dry-run --output-dir dry_out\
+```
+
+**Live deploy into a folder, personal tenant, keeping local artifacts:**
+
+```powershell
+.venv\Scripts\python.exe -m ssis2fabric `
+  --dtsx MyPackage.dtsx `
+  --workspace-id 12c5e906-5bfc-4ba4-bd76-c1ce68fc53c8 `
+  --tenant b3273975-61bb-4d27-9cb1-4df0bb8a0018 `
+  --folder "SSIS Migration" --output-dir deploy_out\
+```
+
+**Connection-less pipeline shell (connections already exist in the workspace):**
+
+```powershell
+ssis2fabric --dtsx MyPackage.dtsx --workspace-id <guid> --no-connections
+```
+
+Full command variants and expected console output are in
+[migration-workflow.md](resources/migration-workflow.md).
 
 ---
 
