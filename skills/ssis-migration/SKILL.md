@@ -14,7 +14,8 @@ description: >-
   deploy the pipeline to a workspace, (4) dry-run and review a conversion before
   touching Fabric. Triggers: "migrate SSIS to Fabric", "ssis to fabric", "convert
   dtsx", "dtsx to fabric pipeline", "ssis2fabric", "port SSIS to Fabric Data
-  Factory", "ssis dataflow gen2".
+  Factory", "ssis dataflow gen2", "I have an SSIS package", "I have a package
+  called", "move my package to Fabric".
 ---
 
 > **Update Check — ONCE PER SESSION (mandatory)**
@@ -24,13 +25,17 @@ description: >-
 > - Skip if the check was already performed earlier in this session.
 
 > **CRITICAL NOTES**
-> 1. To find a Fabric workspace ID from its name: list all workspaces, then JMESPath-filter by `displayName`.
-> 2. To find an item ID (pipeline / dataflow / connection): list items of that type in the workspace, then JMESPath-filter by name.
-> 3. **Always `--dry-run --output-dir` first** — it parses and converts with NO Fabric API calls and NO auth. Review the JSON before any live run.
-> 4. **Validate the `--workspace-id` GUID** (8-4-4-4-12). A malformed ID returns an opaque `400 BadRequest`.
-> 5. **Connections never carry credentials.** Real connections are created with placeholder creds (or omitted as connection-less shells); the user MUST wire server / database / credentials in Fabric afterward.
-> 6. **Non-default / personal tenants require `--tenant`**, or login defaults to the home tenant and workspace access fails.
-> 7. **InActive activities are expected** — they are the manual follow-up list, not a failure; the pipeline still deploys.
+> 1. **Assume the user is an SSIS expert but new to Fabric.** Guide them — don't expect them to know workspace IDs, tenants, connections, or `.dtsx` paths up front. Run the intake interview and the readiness gate below before invoking the tool.
+> 2. **If the user names a package but not its location** (e.g. "I have a package called Foobar"), locate it before asking the user: search the workspace for `Foobar.dtsx` (file search / glob). Confirm a single match, disambiguate multiple matches, and only ask for the path if none are found.
+> 3. To find a Fabric workspace ID from its name: list all workspaces, then JMESPath-filter by `displayName`.
+> 4. To find an item ID (pipeline / dataflow / connection): list items of that type in the workspace, then JMESPath-filter by name.
+> 5. **Always `--dry-run --output-dir` first** — it parses and converts with NO Fabric API calls and NO auth. Review the JSON before any live run.
+> 6. **Validate the `--workspace-id` GUID** (8-4-4-4-12). A malformed ID returns an opaque `400 BadRequest`.
+> 7. **Connections never carry credentials.** Real connections are created with placeholder creds (or omitted as connection-less shells); the user MUST wire server / database / credentials in Fabric afterward.
+> 8. **Non-default / personal tenants require `--tenant`**, or login defaults to the home tenant and workspace access fails.
+> 9. **InActive activities are expected** — they are the manual follow-up list, not a failure; the pipeline still deploys.
+> 10. **Re-deploys are idempotent** — items are matched by display name and updated in place (same GUID), never duplicated. After a converter fix or package edit, just re-run the same command to push updated definitions.
+> 11. **Generated Dataflow Gen2 M must be valid Power Query** — never let a `// TODO` comment land **between** a function call's arguments (M `//` runs to end of line and silently truncates the call). A malformed mashup.pq makes the Dataflow fail to open in the Fabric editor.
 
 # SSIS (.dtsx) → Microsoft Fabric Migration
 
@@ -58,6 +63,60 @@ the original SSIS task so an engineer can finish it by hand.
 > *migrates* an existing `.dtsx` package into Fabric. If the user wants to build
 > a package or a converter test, use `ssis-authoring`. If they want to move a
 > real package into a Fabric workspace, use this skill.
+
+---
+
+## Guided migration (act as the migration agent)
+
+The typical user is **an SSIS developer who is new to Microsoft Fabric**. They
+know their packages cold but may not know what a workspace ID, tenant, or Fabric
+connection is. Do not dump CLI flags on them. Instead, **drive the migration
+conversationally**: find out what they have, fill in the Fabric-side gaps
+yourself, teach as you go, and only run the tool once the inputs are valid.
+
+### Step 1 — Locate the package
+
+When the user refers to a package by name without a path (e.g. *"I have a
+package called CustomerLoad"*):
+
+1. **Search before asking.** Glob the workspace for `*CustomerLoad*.dtsx`.
+2. **One match** → confirm it: *"Found `CustomerLoad.dtsx` in `etl/` — use that?"*
+3. **Multiple matches** → list them and ask which one.
+4. **No match** → *then* ask for the full path, or offer to convert a package
+   they point to outside the workspace.
+
+### Step 2 — Intake interview (collect the required inputs)
+
+Gather what the tool needs, resolving Fabric concepts on the user's behalf:
+
+| Input | How to obtain it (don't just ask cold) |
+|---|---|
+| `.dtsx` path | Located in Step 1. |
+| Target **workspace** | Ask for the workspace **name**, then resolve the GUID yourself (list workspaces → filter by `displayName`). |
+| **Tenant** | Only raise if the workspace is in a personal / non-home tenant. Explain why it's needed. |
+| **Auth mode** | Default to interactive browser login. Suggest `--device-code` for remote shells, `--service-principal` only for CI. |
+| **Scope** | Ask whether to include connections and dataflows now, or stabilize the control-flow pipeline first (`--no-connections` / `--no-dataflows`). |
+
+Translate Fabric concepts into SSIS terms as needed — e.g. *"a Dataflow Gen2 is
+the Fabric equivalent of your Data Flow Task; a Fabric Connection is like a
+Connection Manager, minus the stored credentials."*
+
+### Step 3 — Readiness gate (before running Python)
+
+Do **not** invoke the tool until all of these hold. If any fail, go back and
+resolve it with the user:
+
+- [ ] `.dtsx` file located and readable.
+- [ ] Workspace **name resolved to a valid GUID** (8-4-4-4-12).
+- [ ] Tenant decided (default vs. `--tenant`).
+- [ ] Auth mode chosen.
+- [ ] **Dry-run completed and reviewed** with the user (`--dry-run --output-dir`).
+
+### Step 4 — Convert, then finish in Fabric
+
+Run the live deploy, then walk the user through the post-migration list: wiring
+connection credentials and reactivating InActive activities (these are expected —
+frame them as the follow-up checklist, not a failure).
 
 ---
 

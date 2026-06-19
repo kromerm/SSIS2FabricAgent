@@ -148,7 +148,7 @@ def _conn_expr(cm: Any) -> str:
     cm is an SSISConnectionManager (or None).
     """
     if cm is None:
-        return 'Sql.Database("TODO_SERVER", "TODO_DATABASE")  // TODO: set real server/database'
+        return 'Sql.Database("TODO_SERVER", "TODO_DATABASE")'
     ct = (cm.connection_type or "").upper()
     server = cm.server_name or "TODO_SERVER"
     database = cm.database_name or "TODO_DATABASE"
@@ -162,7 +162,7 @@ def _conn_expr(cm: Any) -> str:
     if "EXCEL" in ct:
         # Excel via file path — use the connection string (full path is in server_name for EXCEL)
         path = cm.connection_string or server
-        return f'Excel.Workbook(File.Contents({_m_string(path)}), null, true)  // TODO: migrate to Fabric Lakehouse'
+        return f'Excel.Workbook(File.Contents({_m_string(path)}), null, true)'
     # Default: SQL / OLEDB / ADO.NET
     return f'Sql.Database({_m_string(server)}, {_m_string(database)})'
 

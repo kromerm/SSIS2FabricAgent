@@ -53,12 +53,18 @@ failure.
 | Connection create `FAIL`, run continues | Dummy credentials rejected, or transient API error | The CLI falls back to the dummy ID and emits a connection-less shell; wire the connection in Fabric. |
 | Task parsed as `Unknown` / mapped to `Wait` | `DTS:CreationName` not recognized by the parser | No direct Fabric equivalent — replace the InActive `Wait`/`Script` activity by hand. |
 | Dataflow M full of `// TODO` | Values not derivable from SSIS metadata | Fill in real columns/keys/types in the Dataflow Gen2 editor. |
+| Dataflow Gen2 item won't open / load in the Fabric editor | Invalid Power Query M — most often a `// TODO` comment placed **inside** a function call (e.g. between `Sql.Database(...)` and the rest of `Value.NativeQuery`), which comments out the rest of the line | Fixed in `converters/dataflow.py` (placeholders are bare expressions, no inline comments). If hand-editing M, keep comments on their own line or at end-of-line **after** a complete expression — never mid-call. Decode and inspect `mashup.pq` from the item definition to confirm valid M. |
 | Pipeline create failed but JSON exists | API rejected the final definition | Import `pipeline_<name>.json` from `--output-dir` manually in Fabric; re-run with `--verbose` to see the HTTP error. |
 
 ---
 
 ## Tips
 
+- **Re-running the deploy is idempotent.** Items are matched by display name:
+  an existing pipeline / dataflow / connection is **updated in place** (same
+  GUID) rather than duplicated. So after fixing a converter bug or editing the
+  package, just re-run the same command to push updated definitions over the
+  existing items — no manual cleanup needed.
 - Re-run **dry-run + `--output-dir`** after editing the package to diff the
   generated JSON before redeploying.
 - Use `--no-dataflows` to iterate on the control-flow pipeline alone, then add

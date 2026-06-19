@@ -9,6 +9,16 @@ instead (see [task-mapping.md](task-mapping.md)).
 Each component becomes one M step. Every generated step carries a `// TODO`
 annotation wherever a value cannot be derived automatically.
 
+> **M syntax rule (critical):** a `// TODO` comment must NEVER sit **between the
+> arguments of a function call** — in Power Query M, `//` runs to end of line, so
+> an inline comment placed inside `Value.NativeQuery(Sql.Database(...) // TODO,
+> "SELECT ...", null)` silently comments out the rest of the call (the SQL string
+> and closing paren) and makes the whole query invalid. **Symptom:** the Dataflow
+> Gen2 item fails to open/load in the Fabric editor. Place a TODO note on its own
+> line or at end-of-line **after** the complete expression — never mid-call. The
+> connection placeholders are now emitted as bare `Sql.Database("TODO_SERVER",
+> "TODO_DATABASE")` (self-documenting, no inline comment).
+
 ---
 
 ## Component mapping

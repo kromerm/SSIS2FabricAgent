@@ -23,6 +23,8 @@ Activities that cannot be fully auto-converted are created with **`state: InActi
 - A Microsoft Fabric workspace where you have **Contributor** or higher access
 - A browser (for interactive Microsoft Entra ID sign-in)
 
+> **Using the `ssis-migration` Copilot skill?** The skill is only an orchestration layer — it drives this CLI, it does not replace it. You must install `ssis2fabric` (see [Installation](#installation) below) on the machine where Copilot runs before the skill can convert a package.
+
 ---
 
 ## Installation
@@ -254,6 +256,15 @@ Components are mapped to M expression steps:
 
 All steps contain `// TODO` annotations where manual adjustment is needed.
 
+> **M syntax rule:** generated Power Query M must stay valid. A `// TODO` comment
+> must never sit **between the arguments of a function call** — in M, `//` runs to
+> end of line, so an inline comment inside e.g. `Value.NativeQuery(Sql.Database(...)
+> // TODO, "SELECT ...", null)` comments out the SQL string and closing paren and
+> breaks the whole query. **Symptom:** the Dataflow Gen2 item fails to open in the
+> Fabric editor. Connection placeholders are emitted as bare
+> `Sql.Database("TODO_SERVER", "TODO_DATABASE")` (no inline comment); keep any hand-
+> added TODO notes on their own line or at end-of-line after a complete expression.
+
 ### Connections → Fabric Connections
 
 SSIS connection types are mapped to Fabric connectivity types:
@@ -296,6 +307,11 @@ When `--output-dir` is specified the following files are written:
    - Fix `// TODO` expressions throughout the M query.
 4. Update connection credentials via **Fabric > Manage connections and gateways**.
 5. Run the pipeline in Debug mode and iterate.
+
+> **Re-deploys are idempotent.** Items are matched by display name, so re-running
+> the same command **updates the existing pipeline / dataflow / connection in place**
+> (same GUID) instead of creating duplicates. After fixing a converter bug or editing
+> the package, just re-run the deploy to roll out the updated definitions.
 
 ---
 
