@@ -333,7 +333,83 @@ SSIS3/
 │   └── fabric/
 │       ├── __init__.py
 │       └── client.py      # Fabric REST API client (user-auth)
+├── skills/
+│   └── ssis-authoring/
+│       └── SKILL.md       # SSIS Generator skill (prompt → .dtsx)
+├── load_dtsx.ps1          # SSIS runtime load validator (PS 5.1)
+├── DualForecastLoad.dtsx  # Runtime-verified populated-data-flow example
 ├── requirements.txt
 ├── pyproject.toml
 └── README.md
 ```
+
+---
+
+## SSIS Generator (Copilot skill)
+
+This repo also ships a **general-purpose SSIS package generator** as a Copilot
+skill at [skills/ssis-authoring/SKILL.md](skills/ssis-authoring/SKILL.md). It is
+the **inverse** of `ssis2fabric`: instead of converting an existing `.dtsx` to
+Fabric, it **creates brand-new, designer-valid `.dtsx` packages from a
+natural-language prompt**.
+
+> Ask Copilot something like *"create an SSIS package that loads a CSV into SQL
+> Server and emails me on failure"* and the skill emits a complete `.dtsx` that
+> **opens in the Visual Studio / SSDT SSIS designer**.
+
+### What it covers
+
+- **Connection managers:** OLE DB / SQL, Flat File, Excel, FTP, HTTP, SMTP.
+- **Control-flow tasks:** Execute SQL, Data Flow, Script, Send Mail, FTP,
+  Expression, File System.
+- **Data flows:** empty (designer-wired) by default, plus a proven
+  populated-pipeline pattern (source → transform → destination).
+- **Containers & precedence:** Sequence, For Loop, ForEach, precedence
+  constraints (success / failure / completion).
+- **Variables & parameters.**
+
+### Fidelity bar: designer-open is the contract
+
+Generated packages are **scaffolds** — the structure, tasks, connections, and
+wiring are correct, but the user supplies real server names, credentials, file
+paths, and finalizes data-flow column mappings in the designer. The contract is
+that the package **opens in SSDT without a load error**.
+
+### Runtime-validated, not just well-formed
+
+XML well-formedness is **not** enough to guarantee a package opens in the
+designer. The skill is backed by a real runtime load check,
+[load_dtsx.ps1](load_dtsx.ps1), which loads a candidate `.dtsx` through the
+actual SSIS managed runtime (`Microsoft.SqlServer.ManagedDTS`,
+`Application.LoadPackage`) with an `IDTSEvents` sink to surface detailed
+`0xC001…` load errors — the **same load path the SSDT designer uses**.
+
+```powershell
+# Must run under Windows PowerShell 5.1 (.NET Framework), not PowerShell 7:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\load_dtsx.ps1 -Path .\MyPackage.dtsx
+# => LOAD OK: MyPackage (Executables=2, Connections=3)
+```
+
+### Hard-won facts baked into the skill
+
+- **SMTP connection managers** use `<SmtpConnectionManager ConnectionString="…"/>`
+  (no `DTS:` prefix), **not** the generic `<DTS:ConnectionManager>` form.
+- **Flat File connection managers** use a column-less scaffold; do **not**
+  hand-author `<DTS:FlatFileColumns>` (the user adds columns in the designer).
+- **Populated data flows are package-format-coupled.** The classic verbose
+  pipeline (numeric component ids, lineage metadata, GUID connection refs) loads
+  **only** inside an old-format package (`MSDTS.Package.1`,
+  `PackageFormatVersion` 2). Embedding it in a modern `Microsoft.Package` (v8)
+  package fails with `0xC001001C` reference-id errors. For a populated flow that
+  opens in SSDT, author the **whole** package in the old format and reuse a
+  known-good pipeline block. The empty Data Flow task is the safe default for
+  modern packages.
+- Pipeline-internal ids are scoped **per data flow**, so a known-good pipeline
+  block can be reused for multiple data flows in one package (only the
+  *executable* `DTSID` / `ObjectName` must be unique).
+
+### Verified example
+
+[DualForecastLoad.dtsx](DualForecastLoad.dtsx) is a runtime-verified package with
+**two populated data flows** (OLE DB Source → Derived Column → Excel
+Destination), confirmed `LOAD OK (Executables=2, Connections=2)`.
